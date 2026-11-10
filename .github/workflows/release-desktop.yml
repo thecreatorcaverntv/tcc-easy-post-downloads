@@ -1,0 +1,192 @@
+name: Free public builder · Release desktop apps
+
+on:
+  # Intentionally manual-only so pushes and tags never consume hosted-runner minutes.
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Build target
+        required: true
+        default: all
+        type: choice
+        options: [macos, windows, all]
+
+concurrency:
+  group: manual-desktop-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  prepare_release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+        with:
+
+          repository: thecreatorcaverntv/tcc-easy-post-source
+
+          ref: ${{ inputs.source_ref }}
+
+          ssh-key: ${{ secrets.TCC_SOURCE_DEPLOY_KEY }}
+
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Prepare hidden release
+        id: prepare
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}"
+          if gh release view "$TAG" --repo thecreatorcaverntv/tcc-easy-post-downloads --json isDraft --jq .isDraft > /tmp/tcc-release-draft.txt 2>/dev/null; then
+            if [ "$(cat /tmp/tcc-release-draft.txt)" != "true" ]; then
+              echo "This version is already published. Increment package.json before building a new release."
+              exit 1
+            fi
+          else
+            gh release create "$TAG" --repo thecreatorcaverntv/tcc-easy-post-downloads --draft --title "The Creator Cavern Dashboard $TAG" --notes "Creator workspace improvements and reliability fixes. Installers appear publicly only after Windows and both Mac builds are complete."
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: prepare_release
+    if: inputs.platform == 'windows' || inputs.platform == 'all'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+        with:
+
+          repository: thecreatorcaverntv/tcc-easy-post-source
+
+          ref: ${{ inputs.source_ref }}
+
+          ssh-key: ${{ secrets.TCC_SOURCE_DEPLOY_KEY }}
+
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - run: npm install --global pnpm@11.25.0 --no-audit --no-fund
+      - run: pnpm install --frozen-lockfile
+      - run: npm run check
+      - run: npm test
+      - name: Build Windows installer and portable app
+        shell: pwsh
+        run: |
+          npm run dist:win-unpacked
+          Compress-Archive -Path 'dist\win-unpacked\*' -DestinationPath 'dist\Creator-Cavern-Dashboard-Windows-Portable.zip' -Force
+          npm run dist:win
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Verify standard installer and uninstaller
+        shell: pwsh
+        run: ./scripts/test-installer.ps1
+      - name: Publish Windows downloads without Actions artifact storage
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = node -p "require('./package.json').version"
+          $tag = "v$version"
+          $assets = Get-ChildItem dist -File | Where-Object { $_.Name -match '\.(exe|blockmap)$' -or $_.Name -eq 'latest.yml' -or $_.Name -like '*Portable.zip' } | ForEach-Object { $_.FullName }
+          if (-not $assets) { throw 'No Windows release files were produced.' }
+          gh release upload $tag $assets --repo thecreatorcaverntv/tcc-easy-post-downloads --clobber
+
+  macos:
+    needs: prepare_release
+    if: inputs.platform == 'macos' || inputs.platform == 'all'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+        with:
+
+          repository: thecreatorcaverntv/tcc-easy-post-source
+
+          ref: ${{ inputs.source_ref }}
+
+          ssh-key: ${{ secrets.TCC_SOURCE_DEPLOY_KEY }}
+
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - run: npm install --global pnpm@11.25.0 --no-audit --no-fund
+      - run: pnpm install --frozen-lockfile
+      - run: npm run check
+      - run: npm test
+      - name: Build separate Intel and Apple Silicon macOS DMG and ZIP packages
+        run: npx electron-builder --mac dmg zip --x64 --arm64 --publish never
+      - name: Validate macOS application and installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find dist -type d -name 'The Creator Cavern Dashboard.app' -print -quit)"
+          DMG_PATH="$(find dist -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          ZIP_PATH="$(find dist -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$APP_PATH"
+          test -x "$APP_PATH/Contents/MacOS/The Creator Cavern Dashboard"
+          plutil -lint "$APP_PATH/Contents/Info.plist"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          test "$(codesign -dv "$APP_PATH" 2>&1 | sed -n 's/^Signature=//p')" = "adhoc"
+          test -n "$DMG_PATH"
+          hdiutil verify "$DMG_PATH"
+          test -n "$ZIP_PATH"
+          unzip -t "$ZIP_PATH"
+      - name: Publish macOS downloads without Actions artifact storage
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}"
+          find dist -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.blockmap' -o -name 'latest-mac.yml' \) -print0 | \
+            xargs -0 gh release upload "$TAG" --repo thecreatorcaverntv/tcc-easy-post-downloads --clobber
+
+
+  publish_release:
+    needs: [prepare_release, windows, macos]
+    if: ${{ always() && !cancelled() && needs.prepare_release.result == 'success' && (needs.windows.result == 'success' || needs.windows.result == 'skipped') && (needs.macos.result == 'success' || needs.macos.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+        with:
+
+          repository: thecreatorcaverntv/tcc-easy-post-source
+
+          ref: ${{ inputs.source_ref }}
+
+          ssh-key: ${{ secrets.TCC_SOURCE_DEPLOY_KEY }}
+
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Publish only after every required installer and update manifest is uploaded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare_release.outputs.tag }}
+          RELEASE_PLATFORM: ${{ inputs.platform }}
+        run: node scripts/release-ready.mjs thecreatorcaverntv/tcc-easy-post-downloads "$RELEASE_TAG" "$RELEASE_PLATFORM"
+      - name: Verify published downloads without repository credentials
+        if: inputs.platform == 'all'
+        env:
+          RELEASE_TAG: ${{ needs.prepare_release.outputs.tag }}
+        run: node scripts/verify-public-downloads.mjs "${RELEASE_TAG#v}"
