@@ -1,4 +1,5 @@
 name: Free public builder · Verify published release
+run-name: TCC · ${{ inputs.source_ref }}
 
 on:
   workflow_dispatch:
