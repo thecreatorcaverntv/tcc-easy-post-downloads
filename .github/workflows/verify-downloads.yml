@@ -1,0 +1,34 @@
+name: Free public builder · Verify public downloads
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch or commit to build
+        type: string
+        default: main
+        required: true
+      version:
+        description: Published version to verify
+        required: true
+        default: 2.5.51
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: thecreatorcaverntv/tcc-easy-post-source
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.TCC_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Check Windows and both Mac downloads without credentials
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: node scripts/verify-public-downloads.mjs "$RELEASE_VERSION"
