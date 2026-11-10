@@ -1,4 +1,5 @@
 name: Free public builder · Release desktop apps
+run-name: TCC · ${{ inputs.source_ref }}
 
 on:
   # Intentionally manual-only so pushes and tags never consume hosted-runner minutes.
